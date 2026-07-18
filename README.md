@@ -19,6 +19,8 @@
 - **一键完整工作流**：输入品类，全流程自动执行
 - **智能对话路由**：自动理解用户意图，路由到对应 Agent
 - **RAG 知识库**：FAQ + 价格库 + 供应商库 + 产区数据
+- **电商对话 RAG**：基于历史对话的向量检索（MySQL + Milvus），覆盖售前/改地址/使用说明/售后 4 阶段
+- **会话阶段自动识别**：自动判断客户对话阶段，检索最相似的过往对话辅助客服回复
 - **双模式界面**：Gradio Web UI + Rich CLI
 - **持久化记忆**：SQLite 对话历史 + Agent 笔记
 - **LLM 调用监控**：调用统计、耗时追踪、费用计算
@@ -48,7 +50,8 @@
 │  ▸ DeepSeek API (复杂推理)               │
 │  ▸ Ollama (简单任务 + Embedding)          │
 │  ▸ RAG 知识库 (bge-m3 语义检索)           │
-│  ▸ SQLite 持久化                         │
+│  ▸ 对话向量检索 (MySQL + Milvus)          │
+│  ▸ SQLite / JSON 双持久化                 │
 │  ▸ 自动提供者降级 (故障时切换)            │
 │  ▸ LLM 调用监控 + 费用计算               │
 └──────────────────────────────────────────┘
@@ -84,7 +87,8 @@
 ### 前置依赖
 
 - Python 3.10+
-- [Ollama](https://ollama.com/)（本地模型）
+- [Ollama](https://ollama.com/)（本地模型，含 `bge-m3` embedding）
+- Docker Engine 20.10+（可选，用于 MySQL + Milvus 向量检索）
 - DeepSeek API Key（可选，用于复杂推理）
 
 ### 安装
@@ -169,6 +173,14 @@ python main.py
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 | `WEB_PORT` | `7860` | Web 端口 |
 | `WEB_HOST` | `127.0.0.1` | 监听地址 |
+| `MYSQL_HOST` | `localhost` | MySQL 地址（空=使用 JSON 回退） |
+| `MYSQL_PORT` | `3307` | MySQL 端口（映射到容器 3306） |
+| `MYSQL_USER` | `merchant` | MySQL 用户名 |
+| `MYSQL_PASSWORD` | `merchant_pass_2024` | MySQL 密码 |
+| `MYSQL_DATABASE` | `merchant_agent` | MySQL 数据库名 |
+| `MILVUS_HOST` | `localhost` | Milvus 地址（空=使用内存回退） |
+| `MILVUS_PORT` | `19530` | Milvus gRPC 端口 |
+| `MILVUS_COLLECTION` | `conversation_embeddings` | Milvus 集合名 |
 
 ### Agent 模型路由
 
@@ -196,7 +208,7 @@ AGENT_MODEL = {
 | 💬 客服应答 | FAQ 检索 + AI 回复 |
 | 📊 运营分析 | 利润计算 + 定价建议 |
 | 🚀 一键工作流 | 选品→上架→客服→分析 全自动（带进度回调 + 跨 Agent 上下文传递） |
-| 📚 知识管理 | FAQ/价格库/供应商库/模板 在线增删改 |
+| 📚 知识管理 | FAQ/价格库/供应商库/模板/对话记录 在线增删改 |
 | 📊 系统状态 | LLM 调用统计、日趋势、费用追踪 |
 
 ### 用户登录
@@ -250,30 +262,40 @@ docker compose up -d
 
 | 服务 | 端口 | 说明 |
 |------|------|------|
-| ollama | 11434 | 本地 LLM 服务（自动健康检查） |
-| webui | 7860 | Gradio Web 界面 |
+| mysql | 3307 → 3306 | 对话记录持久化（MySQL 8.0） |
+| etcd | 2379 | Milvus 元数据存储 |
+| minio | 9000/9001 | Milvus 日志与快照存储 |
+| milvus | 19530 | 向量 ANN 检索（IVF_FLAT, 1024 维） |
 
-### 环境变量
+### 首次启动
 
-在 `docker-compose.yml` 同目录创建 `.env` 文件：
+```bash
+# 启动 MySQL + Milvus 栈
+docker compose up -d
 
-```ini
-DEEPSEEK_API_KEY=sk-xxxxxxx    # 可选，用于复杂推理
+# 导入种子数据并建立向量索引
+python scripts/migrate_to_mysql.py
 ```
 
 ### 数据持久化
 
 | 卷 | 挂载点 | 说明 |
 |----|--------|------|
-| `ollama_data` | /root/.ollama | Ollama 模型和配置 |
-| `merchant_data` | /app/outputs | 导出文件 |
-| `merchant_db` | /app/agent_memory.db | 对话历史数据库 |
-| `merchant_monitor` | /app/monitor.db | 监控数据库 |
+| `mysql_data` | /var/lib/mysql | 对话记录数据库 |
+| `etcd_data` | /etcd | Milvus 元数据 |
+| `minio_data` | /data | Milvus 日志/快照 |
+| `milvus_data` | /var/lib/milvus | Milvus 向量数据 |
+
+### 自动降级
+
+- **MySQL 不可用** → 自动回退到 JSON 文件存储
+- **Milvus 不可用** → 自动回退到内存缓存 + 线性余弦相似度扫描
 
 ### 查看日志
 
 ```bash
-docker compose logs -f webui
+docker compose logs -f mysql
+docker compose logs -f milvus
 ```
 
 ---
@@ -358,10 +380,12 @@ pytest tests/test_data_manager.py -v
 ## 技术栈
 
 - **LLM**: DeepSeek V4 / Ollama (qwen2)
-- **Embedding**: bge-m3 (本地)
+- **Embedding**: bge-m3 (本地 Ollama, 1024 维)
 - **框架**: ReAct (Plan-Execute-Reflect)
 - **记忆系统**: SQLite + 滑动窗口 + 结构化摘要
 - **RAG**: 语义检索 + 关键词降级
+- **向量检索**: Milvus (Docker, IVF_FLAT) → 内存缓存降级
+- **关系存储**: MySQL 8.0 (Docker) → JSON 文件降级
 - **缓存**: LRU + TTL 内存缓存
 - **限流**: IP 滑动窗口
 - **界面**: Gradio / Rich
@@ -391,6 +415,10 @@ merchant-agent/
 │   ├── rag.py       # 语义检索 + 关键词降级
 │   ├── embedding.py # bge-m3 嵌入
 │   ├── data_manager.py # 知识库 CRUD（Web UI 调用）
+│   ├── db.py        # MySQL 连接管理（自动降级到 JSON）
+│   ├── conversation_records.py # 对话记录 CRUD（MySQL/JSON 双后端）
+│   ├── conversation_rag.py     # 电商对话 RAG 检索
+│   ├── vector_store.py         # Milvus 向量存储（回退到内存缓存）
 │   └── data/        # JSON 数据文件
 ├── tools/           # 工具函数
 │   ├── taobao.py    # 淘宝搜索下拉词
@@ -416,6 +444,18 @@ merchant-agent/
 ---
 
 ## 更新日志
+
+### v2.2 (2026-07)
+- **电商对话 RAG 系统**：基于历史对话的向量检索，自动辅助客服回复
+- **MySQL + Milvus Docker 栈**：MySQL 8.0 存储对话记录，Milvus v2.5.0 向量 ANN 检索
+- **4 阶段对话识别**：售前咨询 / 地址修改 / 使用说明 / 商品售后，自动分类检索
+- **WebUI 对话管理**：查看/搜索/新增/删除历史对话记录，支持按场景和关键词筛选
+- **双后端自动降级**：MySQL 不可用 → JSON 文件；Milvus 不可用 → 内存余弦扫描
+- **密码加盐存储**：用户密码从无盐 SHA256 升级为 salted SHA256
+- **种子数据**：20 条覆盖 4 阶段的真实风格对话示例，一键导入
+- **线程安全缓存**：知识库加载增加线程锁，防止并发读取冲突
+- **Ollama 可达性缓存**：避免每次实例化 Agent 都发 HTTP 请求探测
+- **LLM 降级增强**：精确追踪主提供者是否标记失败，避免误降级
 
 ### v2.1 (2025-07)
 - **LLM 调用监控**：记录每次 LLM 调用的耗时、成功率、Token 消耗和费用
