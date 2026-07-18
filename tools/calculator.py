@@ -23,7 +23,11 @@ def price_suggestion(cost: float, target_margin: float = 30.0,
                     platform_fee_rate: float = 0.05) -> dict:
     """根据目标利润率建议售价"""
     denominator = 1 - platform_fee_rate - target_margin / 100
-    min_price = cost / denominator if denominator > 0 else cost * 10  # 防除零，用 10 倍成本作为保本价
+    if denominator <= 0:
+        # 综合费率 ≥ 100% 时无法计算保本价，回退为成本×10
+        min_price = cost * 10
+    else:
+        min_price = cost / denominator
     competitive_price = cost * 2.5  # 一般电商 2.5 倍定价
     premium_price = cost * 4.0
     return {

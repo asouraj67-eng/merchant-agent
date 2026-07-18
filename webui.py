@@ -2,10 +2,10 @@
 
 import sys
 import os
+import re
 import time
 import logging
 import uuid
-import json
 import hashlib
 from datetime import datetime
 
@@ -17,31 +17,54 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import csv
 import io
 import gradio as gr
-from llm import check_llm, check_ollama, list_models, stream_chat
+from llm import check_llm, check_ollama, list_models
 from orchestrator import MerchantOrchestrator
 from knowledge.data_manager import (
-    get_all_faqs, add_faq, update_faq, delete_faq,
+    get_all_faqs, add_faq, delete_faq,
     get_price_library, add_price_subcategory, delete_price_subcategory,
     get_suppliers, add_supplier, delete_supplier_product,
     get_all_templates, get_all_categories,
+    get_all_conversation_records,
+    add_conversation_record_entry,
+    delete_conversation_record_entry,
 )
 from monitor import get_stats, get_recent_calls, get_daily_stats
-from config import LOG_LEVEL, LOG_FORMAT, RATE_LIMIT_ENABLED, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, CACHE_ENABLED, LLM_PROVIDER, WEB_PORT, ADMIN_USER, ADMIN_PASS
+from config import LOG_LEVEL, LOG_FORMAT, RATE_LIMIT_ENABLED, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, LLM_PROVIDER, WEB_PORT, ADMIN_USER, ADMIN_PASS
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
-orch = MerchantOrchestrator()
+# 延迟初始化：避免模块导入时就失败
+_orch: MerchantOrchestrator | None = None
+
+def _get_orch() -> MerchantOrchestrator:
+    global _orch
+    if _orch is None:
+        _orch = MerchantOrchestrator()
+    return _orch
 
 _rate_limit_store: dict[str, list[float]] = {}
 
-USERS_DB = os.path.join(os.path.dirname(__file__), "agent_memory.db")
+USERS_DB = os.path.join(os.path.dirname(__file__), "users.db")
 
-def _hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def _hash_password(password: str, salt: str = None) -> str:
+    """Salted SHA256: 返回 salt:hexdigest 格式"""
+    if salt is None:
+        salt = os.urandom(16).hex()
+    return f"{salt}:{hashlib.sha256((salt + password).encode('utf-8')).hexdigest()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """验证密码，兼容旧版无盐哈希"""
+    if ":" not in stored:
+        # 旧版无盐哈希 — 升级为加盐
+        return stored == hashlib.sha256(password.encode("utf-8")).hexdigest()
+    salt, pwd_hash = stored.split(":", 1)
+    return pwd_hash == hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 def _init_users():
-    """Initialize users table with hashed password storage"""
+    """Initialize users table — ONLY create default admin if no users exist"""
     import sqlite3
     conn = sqlite3.connect(USERS_DB)
     conn.execute("""
@@ -51,26 +74,28 @@ def _init_users():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Create default admin account if not exists
     try:
-        conn.execute("INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)",
-                     (ADMIN_USER, _hash_password(ADMIN_PASS)))
-        conn.commit()
+        existing = conn.execute("SELECT 1 FROM users WHERE username=?", (ADMIN_USER,)).fetchone()
+        if existing is None:
+            conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
+                         (ADMIN_USER, _hash_password(ADMIN_PASS)))
+            conn.commit()
+            logger.info(f"Created default admin user '{ADMIN_USER}'")
     except sqlite3.Error as e:
-        logger.warning(f"创建默认用户失败: {e}")
+        logger.warning(f"初始化用户表失败: {e}")
     conn.close()
 
-_init_users()
 
 def check_login(username: str, password: str) -> bool:
-    """Gradio auth callback with hashed password verification"""
+    """Gradio auth callback with salted password verification"""
     import sqlite3
     try:
         conn = sqlite3.connect(USERS_DB)
-        row = conn.execute("SELECT 1 FROM users WHERE username=? AND password=?",
-                           (username, _hash_password(password))).fetchone()
+        row = conn.execute("SELECT password FROM users WHERE username=?", (username,)).fetchone()
         conn.close()
-        return row is not None
+        if row is None:
+            return False
+        return _verify_password(password, row[0])
     except Exception:
         return False
 
@@ -127,7 +152,7 @@ def agent_chat(message, history, request: gr.Request):
     try:
         logger.info(f"Chat session={session_id[:20]}: {message[:60]}")
         yield "🤔 正在分析你的问题..."
-        response = orch.smart_chat(message, session_id=session_id)
+        response = _get_orch().smart_chat(message, session_id=session_id)
         yield response
     except Exception as e:
         logger.error(f"chat 异常: {e}", exc_info=True)
@@ -142,7 +167,7 @@ def run_selector(category, budget, audience, request: gr.Request):
     username = getattr(request, "username", "anonymous") or "anonymous"
     session_id = f"sel_{username}_{uuid.uuid4().hex[:6]}"
     try:
-        result = orch.run_agent("selector", category, session_id=session_id, budget=budget, target_audience=audience)
+        result = _get_orch().run_agent("selector", category, session_id=session_id, budget=budget, target_audience=audience)
         report = result.get("report", "生成失败")
         recs = result.get("recommendations", [])
         rec_text = "📊 数据来源：淘宝搜索下拉词（真实用户搜索需求）\n\n"
@@ -166,7 +191,7 @@ def run_lister(name, category, features, price, cost, request: gr.Request):
     session_id = f"list_{username}_{uuid.uuid4().hex[:6]}"
     try:
         info = {"name": name, "category": category, "features": features, "target_price": price, "cost": cost}
-        result = orch.run_agent("lister", info, session_id=session_id)
+        result = _get_orch().run_agent("lister", info, session_id=session_id)
         content = result.get("listing_content", "生成失败")
         saved = result.get("saved_to", "")
         if saved:
@@ -185,10 +210,8 @@ def run_sourcing(name, category, target_price, expected_sales, budget, request: 
     session_id = f"src_{username}_{uuid.uuid4().hex[:6]}"
     try:
         info = {"name": name, "category": category, "target_price": target_price, "expected_sales": expected_sales, "budget": budget}
-        result = orch.run_agent("sourcing", info, session_id=session_id)
-        report = result.get("report", "生成失败")
-        tc = result.get("tool_calls", 0)
-        return report + f"\n\n---\n🤖 AI 自主调用了 {tc} 次工具分析"
+        result = _get_orch().run_agent("sourcing", info, session_id=session_id)
+        return result.get("report", "生成失败")
     except Exception as e:
         return f"❌ 处理出错: {e}"
 
@@ -201,7 +224,7 @@ def run_service(query, product_context, request: gr.Request):
     username = getattr(request, "username", "anonymous") or "anonymous"
     session_id = f"svc_{username}_{uuid.uuid4().hex[:6]}"
     try:
-        result = orch.run_agent("service", query, session_id=session_id, product_context=product_context)
+        result = _get_orch().run_agent("service", query, session_id=session_id, product_context=product_context)
         return result.get("answer", "生成失败")
     except Exception as e:
         return f"❌ 处理出错: {e}"
@@ -219,7 +242,7 @@ def run_analyst(data, cost, price, volume, request: gr.Request):
         if cost: pricing_data["cost"] = cost
         if price: pricing_data["price"] = price
         if volume: pricing_data["volume"] = volume
-        result = orch.run_agent("analyst", data if not pricing_data else {**pricing_data, "data": data}, session_id=session_id)
+        result = _get_orch().run_agent("analyst", data if not pricing_data else {**pricing_data, "data": data}, session_id=session_id)
         report = result.get("report", "生成失败")
         pricing = result.get("pricing_advice")
         pt = ""
@@ -250,7 +273,7 @@ def run_workflow(category, budget, audience, request: gr.Request):
         # 步骤 1/4: 选品分析
         yield output + "⏳ **步骤 1/4：选品分析中...**\n"
         try:
-            sel_result = orch.run_agent("selector", category, session_id=session_id, budget=budget, target_audience=audience)
+            sel_result = _get_orch().run_agent("selector", category, session_id=session_id, budget=budget, target_audience=audience)
             results["selector"] = sel_result
             output += f"## 📋 选品分析\n{sel_result.get('report', 'N/A')}\n\n"
         except Exception as e:
@@ -261,7 +284,7 @@ def run_workflow(category, budget, audience, request: gr.Request):
         yield output + "⏳ **步骤 2/4：上架素材生成中...**\n"
         try:
             list_input = f"品类: {category}\n预算: {budget}\n目标人群: {audience}"
-            list_result = orch.run_agent("lister", list_input, session_id=session_id)
+            list_result = _get_orch().run_agent("lister", list_input, session_id=session_id)
             results["lister"] = list_result
             output += f"## 📝 上架素材\n{list_result.get('listing_content', list_result.get('report', 'N/A'))}\n\n"
         except Exception as e:
@@ -271,7 +294,7 @@ def run_workflow(category, budget, audience, request: gr.Request):
         # 步骤 3/4: 客服
         yield output + "⏳ **步骤 3/4：客服话术生成中...**\n"
         try:
-            svc_result = orch.run_agent("service", f"品类: {category} 的常见客服问题", session_id=session_id)
+            svc_result = _get_orch().run_agent("service", f"品类: {category} 的常见客服问题", session_id=session_id)
             results["service"] = svc_result
             output += f"## 💬 客服应答\n{svc_result.get('answer', svc_result.get('report', 'N/A'))}\n\n"
         except Exception as e:
@@ -281,7 +304,7 @@ def run_workflow(category, budget, audience, request: gr.Request):
         # 步骤 4/4: 运营分析
         yield output + "⏳ **步骤 4/4：运营分析中...**\n"
         try:
-            an_result = orch.run_agent("analyst", f"新店铺启动\n品类: {category}\n预算: {budget}\n目标人群: {audience}", session_id=session_id)
+            an_result = _get_orch().run_agent("analyst", f"新店铺启动\n品类: {category}\n预算: {budget}\n目标人群: {audience}", session_id=session_id)
             results["analyst"] = an_result
             output += f"## 📊 运营建议\n{an_result.get('report', 'N/A')}\n\n"
         except Exception as e:
@@ -334,7 +357,7 @@ def run_batch_listing(file):
         name = product.get("name", f"商品{i}")
         yield f"⏳ ({i}/{total}) {name} 生成中...\n", all_results
         try:
-            result = orch.run_agent("lister", product)
+            result = _get_orch().run_agent("lister", product)
             item = {"index": i, "name": name, "content": result.get("listing_content", "生成失败")}
             all_results.append(item)
             output += f"---\n### ✅ {i}. {name}\n{item['content']}\n\n"
@@ -361,6 +384,7 @@ def export_batch_csv(results):
         t2 = titles[1].split("：")[-1].strip() if len(titles) > 1 else ""
         t3 = titles[2].split("：")[-1].strip() if len(titles) > 2 else ""
         out.write(f"{name},{t1},{t2},{t3},\n")
+    # 用 delete=True，Gradio 会在下载完成后自动读取
     tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".csv", delete=False)
     tmp.write(out.getvalue())
     tmp.close()
@@ -444,6 +468,52 @@ def refresh_template_view():
         lines.append("")
     return "\n".join(lines)
 
+
+def refresh_conversation_view(stage: str = "", query: str = ""):
+    from knowledge.conversation_records import get_records, STAGES
+    try:
+        records = get_records(stage=stage, keyword=query, limit=200)
+    except Exception:
+        records = get_all_conversation_records()
+    if not records:
+        return "（暂无对话记录，新增记录后系统会自动检索相似对话辅助客服回复）"
+    lines = [f"共 {len(records)} 条记录：\n"]
+    for r in records:
+        stage_label = STAGES.get(r.get("stage", ""), r.get("stage", ""))
+        tags = ", ".join(r.get("tags", [])) if r.get("tags") else ""
+        outcome = f" → {r['outcome']}" if r.get("outcome") else ""
+        product_info = f" [{r['product']}]" if r.get("product") else ""
+
+        lines.append(f"**ID:{r['id']}** | {stage_label}{product_info}{outcome}")
+        lines.append(f"- 顾客：{r['customer_question'][:200]}")
+        lines.append(f"- 回复：{r['merchant_response'][:300]}")
+        if tags:
+            lines.append(f"- 标签：{tags}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def add_conversation_entry(stage, question, response, product, category, tags, outcome):
+    if not question.strip() or not response.strip():
+        return "⚠️ 顾客问题和商家回复不能为空", refresh_conversation_view()
+    ok = add_conversation_record_entry(stage, question, response, product, category, tags, outcome)
+    if ok:
+        return "✅ 已添加", refresh_conversation_view()
+    return "❌ 添加失败", refresh_conversation_view()
+
+
+def delete_conversation_entry(record_id):
+    if not record_id or record_id < 1:
+        return "⚠️ 请输入有效的记录 ID", refresh_conversation_view()
+    if delete_conversation_record_entry(int(record_id)):
+        return f"✅ 已删除 ID {int(record_id)}", refresh_conversation_view()
+    return f"❌ 未找到 ID {int(record_id)}", refresh_conversation_view()
+
+
+# ═════════════════════════════════════════════════
+#  系统监控
+# ═════════════════════════════════════════════════
+
 def refresh_system_status():
     try:
         stats = get_stats(24)
@@ -488,7 +558,6 @@ def build_app():
                     agent_chat,
                     title="智能电商助手",
                     description="输入任何电商相关问题",
-                    additional_inputs=[],
                 )
 
             with gr.TabItem("📋 选品分析"):
@@ -623,6 +692,68 @@ def build_app():
                         tmpl_display = gr.Markdown(refresh_template_view)
                         gr.Markdown("> 模板仅支持通过 JSON 文件直接编辑：`knowledge/data/product_templates.json`")
 
+                    # 对话记录管理
+                    with gr.TabItem("对话记录"):
+                        gr.Markdown("### 商家历史对话记录管理")
+                        gr.Markdown("在这里管理商家与顾客的历史对话记录，系统会自动检索相似对话辅助客服回复。")
+
+                        with gr.Tabs():
+                            with gr.TabItem("查看对话记录"):
+                                conv_display = gr.Markdown(refresh_conversation_view)
+                                conv_search_stage = gr.Dropdown(
+                                    label="按场景筛选",
+                                    choices=[("全部", ""), ("售前咨询", "pre_sale"), ("地址修改", "post_sale_address"),
+                                             ("使用说明", "post_sale_usage"), ("商品售后", "after_sales")],
+                                    value="",
+                                )
+                                conv_search_query = gr.Textbox(label="关键词搜索（可选）", placeholder="输入搜索关键词...")
+                                conv_search_btn = gr.Button("🔍 搜索", variant="primary")
+                                conv_search_btn.click(refresh_conversation_view,
+                                                      [conv_search_stage, conv_search_query], conv_display)
+                                gr.Markdown("---")
+
+                            with gr.TabItem("新增对话记录"):
+                                with gr.Row():
+                                    conv_stage = gr.Dropdown(
+                                        label="对话场景",
+                                        choices=[("售前咨询（卖点/性能/性价比）", "pre_sale"),
+                                                 ("买后地址修改/查询", "post_sale_address"),
+                                                 ("买后使用说明", "post_sale_usage"),
+                                                 ("商品售后", "after_sales")],
+                                        value="pre_sale",
+                                    )
+                                    conv_outcome = gr.Dropdown(
+                                        label="处理结果",
+                                        choices=[("", ""), ("成交", "成交"), ("未成交", "未成交"),
+                                                 ("已解决", "已解决"), ("退款", "退款"), ("换货", "换货")],
+                                        value="",
+                                    )
+                                conv_question = gr.Textbox(label="顾客问题", placeholder="如：这个杯子保温效果怎么样？", lines=2)
+                                conv_response = gr.Textbox(label="商家回复", placeholder="如：这款杯子采用316不锈钢...", lines=4)
+                                with gr.Row():
+                                    conv_product = gr.Textbox(label="商品名称（可选）", placeholder="如：智能保温杯")
+                                    conv_category = gr.Textbox(label="品类（可选）", placeholder="如：家居日用")
+                                    conv_tags = gr.Textbox(label="标签（可选，逗号分隔）", placeholder="如：保温效果,材质")
+                                btn_conv_add = gr.Button("💾 保存记录", variant="primary")
+                                conv_add_msg = gr.Textbox(label="操作结果", interactive=False)
+                                btn_conv_add.click(
+                                    add_conversation_entry,
+                                    [conv_stage, conv_question, conv_response,
+                                     conv_product, conv_category, conv_tags, conv_outcome],
+                                    [conv_add_msg, conv_display],
+                                )
+
+                            with gr.TabItem("删除记录"):
+                                conv_del_id = gr.Number(label="输入要删除的记录ID", precision=0)
+                                btn_conv_del = gr.Button("🗑️ 删除", variant="stop")
+                                conv_del_msg = gr.Textbox(label="操作结果", interactive=False)
+                                btn_conv_del.click(
+                                    delete_conversation_entry,
+                                    [conv_del_id],
+                                    [conv_del_msg, conv_display],
+                                )
+
+            # ===== Tab 10: 系统状态 =====
             with gr.TabItem("📊 系统状态"):
                 gr.Markdown("### LLM 调用监控（最近 24 小时）")
                 refresh_btn = gr.Button("🔄 刷新数据")
@@ -636,6 +767,10 @@ def build_app():
     return app
 
 def main():
+    # 初始化用户数据库（延迟到启动时执行）
+    _init_users()
+
+    # 启动时自动检查
     ok, _, _ = check_env()
     if not ok:
         logger.warning(f"LLM({LLM_PROVIDER}) 不可用，启动后功能受限")

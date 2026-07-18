@@ -122,11 +122,14 @@ class SelectorAgent(ReActAgent):
         # Post-process: extract structured recommendation data from report
         recommendations = []
 
-        # Extract category-level search volume from report
+        # Extract category-level search volume from report — tolerate varied LLM output
         category_search_volume = 5000
-        vol_report = re.search(r'搜索[热度预估量：:\s]*(\d[\d,.]*万?)', report)
+        vol_report = re.search(
+            r'(?:搜索[热度预估量热度]|月搜索[量]|搜索量)[：:\s]*(\d[\d,.]*\s*万?)',
+            report, re.IGNORECASE,
+        )
         if vol_report:
-            raw = vol_report.group(1).replace(",", "")
+            raw = vol_report.group(1).replace(",", "").strip()
             if "万" in raw:
                 category_search_volume = int(float(raw.replace("万", "")) * 10000)
             else:
@@ -160,15 +163,14 @@ class SelectorAgent(ReActAgent):
                 else:
                     cost = max(int(price * 0.4), 1)
 
+                vol_m = re.search(r'搜索[量：:\s]*(\d+)', line)
                 comp_m = re.search(r'竞争[度：:\s]*(高|中|低)', line)
                 if comp_m:
                     comp_map = {"高": 70, "中": 40, "低": 10}
                     competition = comp_map.get(comp_m.group(1), 50)
-                    # Infer default volume from competition when no category volume
-                    if search_volume == category_search_volume == 5000:
+                    # 未找到商品级搜索量时，用竞争度推断默认搜索量
+                    if not vol_m:
                         search_volume = comp_default_map.get(comp_m.group(1), 5000)
-
-                vol_m = re.search(r'搜索[量：:\s]*(\d+)', line)
                 if vol_m:
                     search_volume = int(vol_m.group(1))
 

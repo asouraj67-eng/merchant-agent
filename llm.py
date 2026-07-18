@@ -7,7 +7,7 @@ import httpx
 from typing import Optional
 
 from config import (
-    OLLAMA_BASE, OLLAMA_MODEL, OLLAMA_FAST_MODEL,
+    OLLAMA_BASE, OLLAMA_MODEL,
     DEEPSEEK_API_KEY, DEEPSEEK_API_BASE, DEEPSEEK_MODEL,
     LLM_PROVIDER, AGENT_TIMEOUT, MAX_RETRIES, LOG_LEVEL,
 )
@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(getattr(logging, LOG_LEVEL))
 
 _http_client = httpx.Client(timeout=AGENT_TIMEOUT)
+# 仅用于健康检查的客户端（短超时，避免启动卡死）
+_health_client = httpx.Client(timeout=10)
 
 def _call_deepseek(
     messages: list[dict],
@@ -291,6 +293,10 @@ def call_llm_with_fallback(
 
     t0 = time.time()
 
+    # Try primary provider with retries
+    # Note: _call_deepseek / _call_ollama 内部已有重试逻辑，
+    # 外层主要负责区分"返回错误内容"和"抛异常"两种情况
+    primary_failed = False
     for attempt in range(MAX_RETRIES + 1):
         try:
             if primary_provider == "deepseek":
@@ -319,8 +325,10 @@ def call_llm_with_fallback(
             if not is_error:
                 return result
 
-            logger.warning(f"{primary_provider} attempt={attempt+1} failed, preparing fallback: {content[:60]}")
-            break  # Primary provider explicitly failed, stop retrying
+            # 返回了错误内容 → 内层已重试过，尝试 fallback
+            logger.warning(f"{primary_provider} attempt={attempt+1} failed: {content[:60]}")
+            primary_failed = True
+            break
 
         except Exception as e:
             elapsed = int((time.time() - t0) * 1000)
@@ -328,12 +336,18 @@ def call_llm_with_fallback(
             if attempt < MAX_RETRIES:
                 time.sleep(1)
                 continue
+            primary_failed = True
             try:
                 from monitor import record_call
                 record_call(provider=primary_provider, model=primary_model, duration_ms=elapsed, success=False, error=str(e), agent=agent, session_id=session_id)
             except Exception:
                 pass
 
+    if not primary_failed:
+        # 所有重试用完且未标记失败（只有异常才会到这里）
+        return {"role": "assistant", "content": f"[错误] {primary_provider} 调用失败（达到最大重试次数）"}
+
+    # Fallback to backup provider
     logger.info(f"Falling back to {fallback_provider}")
     t1 = time.time()
     try:
@@ -365,9 +379,9 @@ def check_llm() -> tuple[bool, str]:
     if provider == "deepseek":
         if not DEEPSEEK_API_KEY:
             return False, "DEEPSEEK_API_KEY not configured"
-        # Simple test: list models
+        # Use short timeout client for health check
         try:
-            resp = _http_client.get(f"{DEEPSEEK_API_BASE}/v1/models", headers={
+            resp = _health_client.get(f"{DEEPSEEK_API_BASE}/v1/models", headers={
                 "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
             })
             if resp.status_code == 200:
@@ -380,7 +394,7 @@ def check_llm() -> tuple[bool, str]:
     else:
         # Ollama check
         try:
-            resp = _http_client.get(f"{OLLAMA_BASE}/api/tags")
+            resp = _health_client.get(f"{OLLAMA_BASE}/api/tags")
             if resp.status_code == 200:
                 models = resp.json().get("models", [])
                 model_names = [m["name"] for m in models[:4]]
@@ -397,7 +411,7 @@ def check_ollama() -> bool:
 def list_models() -> list[str]:
     """List available Ollama models"""
     try:
-        resp = _http_client.get(f"{OLLAMA_BASE}/api/tags")
+        resp = _health_client.get(f"{OLLAMA_BASE}/api/tags")
         if resp.status_code == 200:
             data = resp.json()
             return [m["name"] for m in data.get("models", [])]

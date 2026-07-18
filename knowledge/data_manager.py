@@ -3,8 +3,6 @@
 import json
 import os
 import logging
-from typing import Optional
-from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 
@@ -146,3 +144,29 @@ def get_all_categories() -> list[str]:
         if isinstance(t, dict) and t.get("category"):
             cats.add(t["category"])
     return sorted(cats)
+
+
+# ═════════════════════════════════════════════════
+#  对话记录
+# ═════════════════════════════════════════════════
+
+def get_all_conversation_records() -> list[dict]:
+    """获取所有对话记录"""
+    from knowledge.conversation_records import get_records
+    return get_records(limit=1000)
+
+
+def add_conversation_record_entry(stage: str, customer_question: str,
+                                   merchant_response: str, product: str = "",
+                                   category: str = "", tags: str = "",
+                                   outcome: str = "") -> bool:
+    """添加一条对话记录"""
+    from knowledge.conversation_records import add_record
+    return add_record(stage, customer_question, merchant_response,
+                      product, category, tags, outcome) is not None
+
+
+def delete_conversation_record_entry(record_id: int) -> bool:
+    """删除一条对话记录"""
+    from knowledge.conversation_records import delete_record
+    return delete_record(record_id)

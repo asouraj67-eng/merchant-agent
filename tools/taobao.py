@@ -1,8 +1,5 @@
 """淘宝数据工具 — 搜索下拉词、搜索结果"""
 
-import json
-import time
-from typing import Optional
 import httpx
 
 def suggest(q: str) -> list[dict]:

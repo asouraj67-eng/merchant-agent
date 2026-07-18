@@ -240,3 +240,72 @@ def add_product_record(name: str, price: float, category: str = "",
     from tools.product_manager import add_product
     rec = add_product(name, price, category, platform, note=note)
     return f"已记录：{rec['name']} ¥{rec['price']}（品类：{rec.get('category', '未分类')}）"
+
+
+# ─────────────────────────────────────────────
+# Tool 8: Conversation Record Manager (电商对话记录RAG)
+# ─────────────────────────────────────────────
+
+@tool(description="Search past merchant-customer conversation records by keyword, stage, or product")
+def search_conversations(query: str = "", stage: str = "",
+                         product: str = "", category: str = "",
+                         limit: int = 10) -> str:
+    """搜索历史对话记录，找到类似场景的商家回复参考。
+
+    覆盖四个阶段：
+    - pre_sale: 售前咨询（卖点/性能/性价比）
+    - post_sale_address: 买后地址修改/查询
+    - post_sale_usage: 买后使用说明
+    - after_sales: 商品售后
+
+    Args:
+        query: 搜索关键词，匹配顾客问题、商家回复、标签
+        stage: 筛选场景，可选 pre_sale / post_sale_address / post_sale_usage / after_sales
+        product: 按商品名称筛选（可选）
+        category: 按品类筛选（可选）
+        limit: 返回结果数量上限，默认10
+    """
+    from tools.conversation_manager import search_conversation_records
+    return search_conversation_records(query=query, stage=stage,
+                                        product=product, category=category,
+                                        limit=limit)
+
+
+@tool(description="Add a merchant-customer conversation record so the agent can learn from past interactions")
+def add_conversation_record(stage: str, customer_question: str,
+                            merchant_response: str, product: str = "",
+                            category: str = "", tags: str = "",
+                            outcome: str = "") -> str:
+    """保存一条商家与顾客的真实对话记录，供后续客服参考学习。
+
+    Args:
+        stage: 对话场景。pre_sale=售前咨询, post_sale_address=地址修改, post_sale_usage=使用说明, after_sales=售后
+        customer_question: 顾客的问题/咨询内容
+        merchant_response: 商家的回复内容
+        product: 涉及的商品名称（可选）
+        category: 所属品类（可选）
+        tags: 逗号分隔的标签（可选），如"退换货,质量问题"
+        outcome: 处理结果（可选），如"成交"、"已解决"、"退款"
+    """
+    from tools.conversation_manager import add_conversation_record as _add
+    return _add(stage=stage, customer_question=customer_question,
+                merchant_response=merchant_response, product=product,
+                category=category, tags=tags, outcome=outcome)
+
+
+@tool(description="Delete a conversation record by its ID")
+def delete_conversation_record(record_id: int) -> str:
+    """删除一条历史对话记录。
+
+    Args:
+        record_id: 要删除的记录ID
+    """
+    from tools.conversation_manager import delete_conversation_record as _del
+    return _del(record_id)
+
+
+@tool(description="Get statistics about stored conversation records grouped by stage")
+def conversation_stats() -> str:
+    """查看历史对话记录的数量统计，按场景分组显示。"""
+    from tools.conversation_manager import get_conversation_stats
+    return get_conversation_stats()

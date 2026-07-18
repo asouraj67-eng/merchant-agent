@@ -1,52 +1,101 @@
-version: "3.9"
-
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: merchant-ollama
-    volumes:
-      - ollama_data:/root/.ollama
+  # ── MySQL (对话记录存储) ──
+  mysql:
+    image: mysql:8.0
+    container_name: merchant-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: merchant_root_2024
+      MYSQL_DATABASE: merchant_agent
+      MYSQL_USER: merchant
+      MYSQL_PASSWORD: merchant_pass_2024
     ports:
-      - "11434:11434"
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./scripts/init_mysql.sql:/docker-entrypoint-initdb.d/init.sql:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "merchant", "-pmerchant_pass_2024"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merchant-net
+
+  # ── Milvus Stack ──
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    container_name: merchant-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
       timeout: 10s
       retries: 3
     networks:
       - merchant-net
 
-  webui:
-    build: .
-    container_name: merchant-webui
-    depends_on:
-      ollama:
-        condition: service_healthy
-    ports:
-      - "7860:7860"
+  minio:
+    image: minio/minio:latest
+    container_name: merchant-minio
     environment:
-      - LLM_PROVIDER=ollama
-      - OLLAMA_BASE=http://ollama:11434
-      - OLLAMA_MODEL=qwen2:7b
-      - OLLAMA_FAST_MODEL=qwen2:1.5b
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
-      - WEB_HOST=0.0.0.0
-      - WEB_PORT=7860
-      - LOG_LEVEL=INFO
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
     volumes:
-      - merchant_data:/app/outputs
-      - merchant_db:/app/agent_memory.db
-      - merchant_monitor:/app/monitor.db
+      - minio_data:/data
+    command: minio server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - merchant-net
+
+  milvus:
+    image: milvusdb/milvus:v2.5.0
+    container_name: merchant-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9091/metrics", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     networks:
       - merchant-net
 
 volumes:
-  ollama_data:
-  merchant_data:
-  merchant_db:
-  merchant_monitor:
+  mysql_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
 
 networks:
   merchant-net:

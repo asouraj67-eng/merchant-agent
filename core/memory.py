@@ -5,16 +5,19 @@ import sqlite3
 from typing import Optional
 
 class ConversationMemory:
-    """Persistent conversation memory for agents"""
+    """Persistent conversation memory for agents — reused SQLite connection"""
 
     def __init__(self, db_path: str = None):
         if db_path is None:
             db_path = os.path.join(os.path.dirname(__file__), "..", "agent_memory.db")
         self.db_path = db_path
+        self._conn = None
         self._init_db()
 
     def _get_conn(self):
-        return sqlite3.connect(self.db_path)
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        return self._conn
 
     def _init_db(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -43,66 +46,56 @@ class ConversationMemory:
             );
         """)
         conn.commit()
-        conn.close()
+
+    def _close(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def add_message(self, session_id: str, role: str, content: str):
-        conn = self._get_conn()
-        conn.execute(
+        self._get_conn().execute(
             "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content),
         )
-        conn.commit()
-        conn.close()
+        self._get_conn().commit()
 
     def get_history(self, session_id: str, limit: int = 30) -> list[dict]:
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._get_conn().execute(
             "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id DESC LIMIT ?",
             (session_id, limit),
         ).fetchall()
-        conn.close()
         return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
     def remember(self, key: str, value: str):
         """Store a key-value knowledge"""
-        conn = self._get_conn()
-        conn.execute(
+        self._get_conn().execute(
             "INSERT OR REPLACE INTO knowledge (key, value) VALUES (?, ?)",
             (key, value),
         )
-        conn.commit()
-        conn.close()
+        self._get_conn().commit()
 
     def recall(self, key: str) -> Optional[str]:
         """Retrieve knowledge by key"""
-        conn = self._get_conn()
-        row = conn.execute(
+        row = self._get_conn().execute(
             "SELECT value FROM knowledge WHERE key = ?", (key,)
         ).fetchone()
-        conn.close()
         return row[0] if row else None
 
     def add_note(self, agent_name: str, note: str):
         """Agent can save a note for future reference"""
-        conn = self._get_conn()
-        conn.execute(
+        self._get_conn().execute(
             "INSERT INTO agent_notes (agent_name, note) VALUES (?, ?)",
             (agent_name, note),
         )
-        conn.commit()
-        conn.close()
+        self._get_conn().commit()
 
     def get_notes(self, agent_name: str, limit: int = 10) -> list[str]:
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._get_conn().execute(
             "SELECT note FROM agent_notes WHERE agent_name = ? ORDER BY id DESC LIMIT ?",
             (agent_name, limit),
         ).fetchall()
-        conn.close()
         return [r[0] for r in rows]
 
     def clear_session(self, session_id: str):
-        conn = self._get_conn()
-        conn.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
-        conn.commit()
-        conn.close()
+        self._get_conn().execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+        self._get_conn().commit()

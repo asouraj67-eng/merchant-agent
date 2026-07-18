@@ -3,7 +3,6 @@
 import json
 import os
 from datetime import datetime
-from typing import Optional
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "knowledge", "data")
 DATA_FILE = os.path.join(DATA_DIR, "product_library.json")

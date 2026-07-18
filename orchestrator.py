@@ -120,9 +120,12 @@ class MerchantOrchestrator:
         if not session_id:
             session_id = f"chat_{uuid.uuid4().hex[:8]}"
 
-        # Cache check (same question + same session)
+        # Cache check — 包含消息数作为上下文版本标记，防止缓存过时
+        _cache_key = None
         if self.cache:
-            cached = self.cache.get(f"smart_chat:{session_id}:{user_input}")
+            ctx_count = len(self._memory.get_history(session_id, limit=1))
+            _cache_key = f"smart_chat:{session_id}:{user_input}:ctx{ctx_count}"
+            cached = self.cache.get(_cache_key)
             if cached is not None:
                 logger.info(f"smart_chat cache hit: {user_input[:40]}")
                 return cached
@@ -139,17 +142,22 @@ class MerchantOrchestrator:
                 logger.info(f"smart_chat keyword overrides LLM route: chat→{kw_route} (confidence={confidence})")
                 route = kw_route
 
-        result = self._route_to_agent_with_context(route, user_input, ctx)
+        # ── Inject conversation RAG context ──
+        conv_rag_context = self._get_conversation_context(route, user_input)
+
+        # ── Execute route (with context) ──
+        result = self._route_to_agent_with_context(route, user_input, ctx, conv_rag_context)
 
         ctx.add_message("user", user_input)
         ctx.add_message("assistant", result)
 
         logger.info(f"smart_chat done route={route} session={session_id[:12]}")
-        if self.cache:
-            self.cache.set(f"smart_chat:{session_id}:{user_input}", result)
+        if self.cache and _cache_key:
+            self.cache.set(_cache_key, result)
         return result
 
-    def _route_to_agent_with_context(self, route: str, user_input: str, ctx: AgentContext) -> str:
+    def _route_to_agent_with_context(self, route: str, user_input: str,
+                                      ctx: AgentContext, conv_rag_context: str = "") -> str:
         """Route to specified Agent with history context injection"""
         compressed = ctx.get_compressed_context()
         context_prompt = ""
@@ -157,6 +165,8 @@ class MerchantOrchestrator:
             context_prompt += f"\n[历史摘要]\n{compressed['summary']}"
         if compressed["key_info"]:
             context_prompt += f"\n[关键信息]\n{compressed['key_info']}"
+        if conv_rag_context:
+            context_prompt += f"\n{conv_rag_context}"
 
         if route == "chat":
             logger.info(f"smart_chat → chat (direct LLM with context)")
@@ -179,6 +189,28 @@ class MerchantOrchestrator:
                    or str(result))
         return content
 
+    @staticmethod
+    def _get_conversation_context(route: str, user_input: str) -> str:
+        """Get relevant past conversation records as context"""
+        # Map route to conversation stage
+        route_stage_map = {
+            "service": "",  # Service agent handles stage detection internally
+            "chat": "",
+            "selector": "pre_sale",
+            "lister": "",
+            "analyst": "",
+            "sourcing": "",
+        }
+        stage = route_stage_map.get(route, "")
+        try:
+            from knowledge.conversation_rag import get_conversation_rag
+            rag = get_conversation_rag()
+            return rag.format_context(user_input, stage=stage)
+        except Exception as e:
+            logger.debug(f"Conversation RAG error: {e}")
+            return ""
+
+    # ═══════════════════════════════════════════════
     #  Routing
 
     def _llm_route(self, user_input: str) -> str:

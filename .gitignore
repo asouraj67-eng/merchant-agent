@@ -26,3 +26,10 @@ outputs/
 
 # Env
 .env
+
+# Local databases (auto-generated)
+*.db
+*.db-journal
+
+# Docker compose overrides
+docker-compose.override.yml

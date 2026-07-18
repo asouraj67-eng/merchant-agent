@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from config import LLM_PROVIDER
-from llm import check_llm, check_ollama, list_models
+from llm import check_llm, list_models
 from orchestrator import MerchantOrchestrator
 
 console = Console()

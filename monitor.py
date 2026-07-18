@@ -1,24 +1,23 @@
 """LLM call monitor — tracks call duration, token usage, and cost"""
 
-import time
-import json
 import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 MONITOR_DB = os.path.join(os.path.dirname(__file__), "monitor.db")
 _db_initialized = False
+_db_conn = None
 
 def _get_conn():
-    global _db_initialized
-    conn = sqlite3.connect(MONITOR_DB)
-    conn.row_factory = sqlite3.Row
+    global _db_initialized, _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(MONITOR_DB, check_same_thread=False)
+        _db_conn.row_factory = sqlite3.Row
     if not _db_initialized:
-        conn.executescript("""
+        _db_conn.executescript("""
             CREATE TABLE IF NOT EXISTS llm_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 provider TEXT NOT NULL,
@@ -37,9 +36,9 @@ def _get_conn():
             CREATE INDEX IF NOT EXISTS idx_calls_created ON llm_calls(created_at);
             CREATE INDEX IF NOT EXISTS idx_calls_provider ON llm_calls(provider);
         """)
-        conn.commit()
+        _db_conn.commit()
         _db_initialized = True
-    return conn
+    return _db_conn
 
 # DeepSeek 价格（每百万 token，人民币估算）
 DEEPSEEK_PRICES = {
@@ -75,7 +74,7 @@ def record_call(
         (provider, model, agent, session_id, prompt_tokens, completion_tokens, total_tokens, round(cost, 6), duration_ms, 1 if success else 0, error[:200] if error else ""),
     )
     conn.commit()
-    conn.close()
+    # conn is reused globally, no close
 
 def get_stats(hours: int = 24) -> dict:
     """获取最近 N 小时的统计"""
@@ -107,7 +106,7 @@ def get_stats(hours: int = 24) -> dict:
     for r in rows:
         stats["by_provider"][r[0]] = {"calls": r[1], "cost": round(r[2], 4)}
 
-    conn.close()
+    # conn is reused globally, no close
     return stats
 
 def get_recent_calls(limit: int = 20) -> list[dict]:
@@ -117,7 +116,7 @@ def get_recent_calls(limit: int = 20) -> list[dict]:
         """SELECT * FROM llm_calls ORDER BY id DESC LIMIT ?""",
         (limit,),
     ).fetchall()
-    conn.close()
+    # conn is reused globally, no close
     return [dict(r) for r in rows]
 
 def get_daily_stats(days: int = 7) -> list[dict]:
@@ -133,5 +132,5 @@ def get_daily_stats(days: int = 7) -> list[dict]:
            GROUP BY DATE(created_at) ORDER BY day""",
         (cutoff,),
     ).fetchall()
-    conn.close()
+    # conn is reused globally, no close
     return [{"day": r[0], "calls": r[1], "cost": round(r[2], 4), "avg_duration_ms": round(r[3])} for r in rows]

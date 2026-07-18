@@ -35,8 +35,10 @@ class SemanticRAG:
             data_dir = os.path.join(os.path.dirname(__file__), "data")
         self.data_dir = data_dir
         self._cache: dict[str, Any] = {}
+        self._cache_lock = threading.Lock()  # 保护文件 mtime 缓存
         self._embed_cache: dict[str, list[float]] = self._load_embed_cache()
         self._use_embedding = True
+        self._embedding_failures = 0  # 连续失败计数，用于短路
         self._lock = threading.Lock()
 
     def _load_embed_cache(self) -> dict[str, list[float]]:
@@ -87,22 +89,29 @@ class SemanticRAG:
     def _load(self, filename: str) -> list[dict]:
         path = os.path.join(self.data_dir, filename)
         mtime = os.path.getmtime(path) if os.path.exists(path) else 0
-        cache_entry = self._cache.get(filename)
-        if cache_entry is not None:
-            cached_data, cached_mtime = cache_entry
-            if mtime == cached_mtime:
-                return cached_data
+        with self._cache_lock:
+            cache_entry = self._cache.get(filename)
+            if cache_entry is not None:
+                cached_data, cached_mtime = cache_entry
+                if mtime == cached_mtime:
+                    return cached_data
+        # 重新加载
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         else:
             data = []
-        self._cache[filename] = (data, mtime)
+        with self._cache_lock:
+            self._cache[filename] = (data, mtime)
         return data
 
     def _semantic_search(self, query: str, items: list[dict],
                          text_fields: list[str], k: int) -> list[dict]:
         """语义搜索：embedding 相似度排序"""
+        # 短路：连续 embedding 失败后跳过，直接走关键词
+        if not self._use_embedding:
+            return self._keyword_fallback(query, items, text_fields, k)
+
         query_emb = self._get_or_compute_embedding(query)
         if not query_emb:
             return self._keyword_fallback(query, items, text_fields, k)
@@ -128,8 +137,14 @@ class SemanticRAG:
                 candidates.append((st, emb))
 
         if not candidates:
+            self._embedding_failures += 1
+            if self._embedding_failures >= 3:
+                self._use_embedding = False
+                logger.warning("连续 3 次 embedding 检索无结果，自动降级为关键词检索")
             return self._keyword_fallback(query, items, text_fields, k)
 
+        # 恢复成功后重置失败计数
+        self._embedding_failures = 0
         ranked = rank_by_similarity(query_emb, candidates)
         return [items[idx] for idx, _ in ranked[:k]]
 

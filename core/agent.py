@@ -15,6 +15,10 @@ from llm import call_llm
 logger = logging.getLogger(__name__)
 logger.setLevel(getattr(logging, LOG_LEVEL))
 
+# 缓存 Ollama 可达性（避免每次实例化 Agent 都发 HTTP 请求）
+_ollama_available: bool | None = None
+
+
 class ReActAgent(BaseAgent):
     """Self-driven Agent: ReAct loop + native Function Calling + Plan & Reflect
 
@@ -47,10 +51,15 @@ class ReActAgent(BaseAgent):
             l_prov, _ = _parse_model_spec(self.light_model)
             m_prov, _ = _parse_model_spec(self.model)
             if l_prov == "ollama" and m_prov == "deepseek":
-                import httpx
-                try:
-                    httpx.get(f"{OLLAMA_BASE}/api/tags", timeout=2)
-                except Exception:
+                global _ollama_available
+                if _ollama_available is None:
+                    import httpx
+                    try:
+                        httpx.get(f"{OLLAMA_BASE}/api/tags", timeout=2)
+                        _ollama_available = True
+                    except Exception:
+                        _ollama_available = False
+                if not _ollama_available:
                     self.light_model = self.model
                     logger.warning(f"Ollama unavailable, light model fallback to main: {self.model}")
         self.memory = ConversationMemory() if use_memory else None
@@ -59,9 +68,9 @@ class ReActAgent(BaseAgent):
     def _get_tool_defs(self) -> list[dict]:
         all_defs = get_all_definitions()
         if self.allowed_tools is None:
-            return []  # None → 不允许使用任何工具（纯文本生成）
+            return []  # None → 纯文本生成，不允许使用工具
         if not self.allowed_tools:
-            return all_defs  # 空列表 → 使用全部工具
+            return []  # 空列表 → 同样视作禁用工具（防止误用）
         # 有具体列表 → 只使用列表中的工具
         selected = [d for d in all_defs if d["function"]["name"] in self.allowed_tools]
         if not selected:

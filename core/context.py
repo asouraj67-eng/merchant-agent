@@ -1,7 +1,5 @@
 """Context Manager — 对话上下文管理：摘要压缩 + 滑动窗口 + 关键信息提取"""
 
-import json
-import time
 from typing import Optional
 
 from core.memory import ConversationMemory

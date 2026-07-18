@@ -67,6 +67,23 @@ LOG_FORMAT = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 WEB_PORT = int(os.environ.get("WEB_PORT", "7860"))
 WEB_HOST = os.environ.get("WEB_HOST", "127.0.0.1")
 
+# MySQL 配置（对话记录存储）
+MYSQL_HOST = os.environ.get("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3307"))
+MYSQL_USER = os.environ.get("MYSQL_USER", "merchant")
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "merchant_pass_2024")
+MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "merchant_agent")
+
+# Milvus 配置（向量检索）
+MILVUS_HOST = os.environ.get("MILVUS_HOST", "localhost")
+MILVUS_PORT = int(os.environ.get("MILVUS_PORT", "19530"))
+MILVUS_COLLECTION = os.environ.get("MILVUS_COLLECTION", "conversation_embeddings")
+
 # 默认管理员凭据（首次启动时创建）
+# WARNING: 生产环境务必通过环境变量 ADMIN_USER / ADMIN_PASS 覆盖默认值
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+_ADMIN_IS_DEFAULT = not os.environ.get("ADMIN_PASS")
+if _ADMIN_IS_DEFAULT:
+    import logging as _lg
+    _lg.warning("⚠️ 使用默认管理员密码 (admin123)，生产环境请设置 ADMIN_PASS 环境变量")
